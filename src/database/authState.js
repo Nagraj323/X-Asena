@@ -5,11 +5,12 @@ import { initAuthCreds, proto } from 'baileys';
 
 /**
  * Configuration for retry mechanism
+ * Increased retries for better reliability with session keys
  */
 const RETRY_CONFIG = {
-    maxRetries: 3,
-    retryDelay: 100, // ms
-    backoffMultiplier: 2
+    maxRetries: 5,        // Increased from 3 for critical session keys
+    retryDelay: 50,       // Reduced from 100ms for faster retries
+    backoffMultiplier: 1.5 // Reduced from 2 for more consistent delays
 };
 
 /**
@@ -172,6 +173,10 @@ export const useMultiDbAuthState = async () => {
                     await AuthStateDB.upsert({
                         key: sanitizedKey,
                         value: jsonData
+                    }, {
+                        // Ensure proper transaction handling
+                        transaction: null,
+                        logging: false
                     });
                 }, `writeData(${key})`);
             } catch (error) {
@@ -260,6 +265,9 @@ export const useMultiDbAuthState = async () => {
                 /**
                  * Get multiple keys of a specific type
                  * Handles batch retrieval efficiently
+                 * @param {string} type - The type of keys to retrieve (e.g., 'pre-key', 'session', 'app-state-sync-key', 'lid-mapping', 'device-index')
+                 * @param {string[]} ids - Array of key IDs to retrieve
+                 * @returns {Promise<object>} Object with key-value pairs
                  */
                 get: async (type, ids) => {
                     const data = {};
@@ -271,12 +279,14 @@ export const useMultiDbAuthState = async () => {
                                 let value = await readData(`${type}-${id}.json`);
                                 
                                 // Handle special case for app-state-sync-key
-                                // Convert plain object to proto format
+                                // Convert plain object to proto format using .create()
                                 if (type === 'app-state-sync-key' && value) {
                                     try {
-                                        value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                                        value = proto.Message.AppStateSyncKeyData.create(value);
                                     } catch (protoError) {
                                         console.error(`Failed to convert app-state-sync-key for id ${id}:`, protoError);
+                                        // Return null if conversion fails instead of invalid data
+                                        value = null;
                                     }
                                 }
                                 
@@ -294,14 +304,22 @@ export const useMultiDbAuthState = async () => {
                 /**
                  * Set multiple keys
                  * Handles batch writes efficiently with proper error isolation
+                 * Critical for session keys in Baileys 7.x with LID support
                  */
                 set: async (data) => {
                     const tasks = [];
+                    let sessionCount = 0;
+                    let errorCount = 0;
                     
                     for (const category in data) {
                         for (const id in data[category]) {
                             const value = data[category][id];
                             const key = `${category}-${id}.json`;
+                            
+                            // Track session keys for logging
+                            if (category === 'session') {
+                                sessionCount++;
+                            }
                             
                             // Create isolated task that won't fail the entire batch
                             const task = (async () => {
@@ -312,7 +330,11 @@ export const useMultiDbAuthState = async () => {
                                         await removeData(key);
                                     }
                                 } catch (error) {
-                                    console.error(`Failed to set key ${key}:`, error);
+                                    errorCount++;
+                                    // Only log session errors as they're critical
+                                    if (category === 'session') {
+                                        console.error(`❌ Failed to save session key ${id}:`, error.message);
+                                    }
                                     // Don't throw, just log - partial success is acceptable
                                 }
                             })();
@@ -323,6 +345,16 @@ export const useMultiDbAuthState = async () => {
                     
                     // Wait for all operations to complete
                     await Promise.all(tasks);
+                    
+                    // Log session save summary
+                    if (sessionCount > 0) {
+                        const successCount = sessionCount - errorCount;
+                        console.log(`💾 Saved ${successCount}/${sessionCount} session keys`);
+                        
+                        if (errorCount > 0) {
+                            console.warn(`⚠️ ${errorCount} session keys failed to save - may cause decryption errors`);
+                        }
+                    }
                 }
             }
         },
@@ -357,6 +389,84 @@ export const clearAuthState = async () => {
     } catch (error) {
         console.error('Failed to clear auth state:', error);
         throw error;
+    }
+};
+
+/**
+ * Get statistics about stored auth state
+ * Useful for debugging session issues
+ */
+export const getAuthStateStats = async () => {
+    try {
+        const allKeys = await AuthStateDB.findAll({
+            attributes: ['key'],
+            raw: true
+        });
+        
+        const stats = {
+            total: allKeys.length,
+            creds: 0,
+            sessions: 0,
+            preKeys: 0,
+            senderKeys: 0,
+            appStateSyncKeys: 0,
+            lidMappings: 0,
+            deviceIndex: 0,
+            other: 0
+        };
+        
+        allKeys.forEach(record => {
+            const key = record.key;
+            if (key === 'creds.json') stats.creds++;
+            else if (key.startsWith('session-')) stats.sessions++;
+            else if (key.startsWith('pre-key-')) stats.preKeys++;
+            else if (key.startsWith('sender-key-')) stats.senderKeys++;
+            else if (key.startsWith('app-state-sync-key-')) stats.appStateSyncKeys++;
+            else if (key.startsWith('lid-mapping-')) stats.lidMappings++;
+            else if (key.startsWith('device-index-')) stats.deviceIndex++;
+            else stats.other++;
+        });
+        
+        return stats;
+    } catch (error) {
+        console.error('Failed to get auth state stats:', error);
+        return null;
+    }
+};
+
+/**
+ * Validate auth state integrity
+ * Checks if critical keys exist
+ */
+export const validateAuthState = async () => {
+    try {
+        const stats = await getAuthStateStats();
+        
+        if (!stats) {
+            return { valid: false, error: 'Failed to get stats' };
+        }
+        
+        const issues = [];
+        
+        if (stats.creds === 0) {
+            issues.push('No credentials found');
+        }
+        
+        if (stats.sessions === 0) {
+            issues.push('No sessions found - may have decryption issues');
+        }
+        
+        if (stats.preKeys === 0) {
+            issues.push('No pre-keys found - cannot establish new sessions');
+        }
+        
+        return {
+            valid: issues.length === 0,
+            issues,
+            stats
+        };
+    } catch (error) {
+        return { valid: false, error: error.message };
     }
 };
 
