@@ -1,80 +1,92 @@
 /**
- * Advanced Group Management Plugin for Baileys 7.x.x
- * Handles LID/PN identifiers properly
+ * Advanced Group Management Plugin
+ * Deduplicated, LID-aware, consistent utils API usage
  */
 
-import { command } from "../index.js";
+import { command } from "../plugins.js";
+import {
+  sendMessage,
+  sendError,
+  replyOk,
+  replyFail,
+  getMentions,
+  withTyping,
+} from "../utils/message.js";
+import {
+  getAdmins,
+  getParticipantIds,
+  formatGroupInfo,
+  displayId,
+  resolveTargetUser,
+} from "../utils/group.js";
+import { groupCache } from "../utils/cache.js";
 import { isPnUser, isLidUser } from "../functions.js";
+import { USAGE_HINTS } from "../config/constants.js";
+
+async function getGroupMeta(conn, jid) {
+  const cached = groupCache.get(jid);
+  if (cached) return cached;
+  const meta = await conn.groupMetadata(jid);
+  groupCache.set(jid, meta);
+  return meta;
+}
 
 // ==================== TAG ALL ====================
 command(
   {
     pattern: "tagall",
     fromMe: true,
-    desc: "Tag all group members with their names",
+    desc: "Tag all group members",
     type: "group",
+    groupOnly: true,
   },
   async (message, conn) => {
     try {
-      if (!message.isGroup) {
-        return await conn.sendMessage(message.from, {
-          text: "⚠️ This command can only be used in groups!"
+      await withTyping(conn, message.from, async () => {
+        const groupMetadata = await getGroupMeta(conn, message.from);
+        const participants = groupMetadata.participants;
+        const mentionIds = getParticipantIds(groupMetadata);
+
+        let tagMessage = `*${groupMetadata.subject}*\n\n`;
+        tagMessage += `👥 *Total Members:* ${participants.length}\n\n`;
+
+        participants.forEach((participant, index) => {
+          tagMessage += `${index + 1}. @${displayId(participant)}\n`;
         });
-      }
 
-      // Get group metadata
-      const groupMetadata = await conn.groupMetadata(message.from);
-      const participants = groupMetadata.participants;
-
-      // Build message with all participants
-      let tagMessage = `*${groupMetadata.subject}*\n\n`;
-      tagMessage += `👥 *Total Members:* ${participants.length}\n\n`;
-      
-      // In Baileys 7.x, each participant has:
-      // - id: preferred identifier (LID or PN)
-      // - phoneNumber: phone number (if id is LID)
-      // - lid: LID (if id is PN)
-      const mentionIds = [];
-      
-      participants.forEach((participant, index) => {
-        const id = participant.id;
-        mentionIds.push(id);
-        
-        // Show number based on type
-        let displayNumber = "";
-        if (isPnUser(id)) {
-          // It's a phone number format
-          displayNumber = id.split("@")[0];
-        } else if (isLidUser(id)) {
-          // It's a LID, use phoneNumber field if available
-          displayNumber = participant.phoneNumber 
-            ? participant.phoneNumber.split("@")[0] 
-            : "LID User";
-        }
-        
-        tagMessage += `${index + 1}. @${displayNumber}\n`;
+        await sendMessage(conn, message.from, tagMessage, {
+          mentions: mentionIds,
+          quoted: message,
+        });
       });
-
-      // Send with mentions
-      await conn.sendMessage(
-        message.from,
-        {
-          text: tagMessage,
-          mentions: mentionIds
-        },
-        {
-          quoted: {
-            key: message.key,
-            message: message.message
-          }
-        }
-      );
-
     } catch (error) {
       console.error("Error in tagall command:", error);
-      await conn.sendMessage(message.from, {
-        text: "❌ Failed to tag all members."
+      await replyFail(conn, message, "Failed to tag all members.");
+    }
+  }
+);
+
+// ==================== NOTIFY ====================
+command(
+  {
+    pattern: "notify",
+    fromMe: true,
+    desc: "Ping everyone with a short alert",
+    type: "group",
+    groupOnly: true,
+  },
+  async (message, conn) => {
+    try {
+      await withTyping(conn, message.from, async () => {
+        const groupMetadata = await getGroupMeta(conn, message.from);
+        await sendMessage(conn, message.from, "🔔 Attention everyone! 🔔", {
+          mentions: getParticipantIds(groupMetadata),
+          quoted: message,
+        });
       });
+    } catch (error) {
+      console.error("Error in notify command:", error);
+      await replyFail(conn, message, "Failed to notify members.");
     }
   }
 );
@@ -86,83 +98,23 @@ command(
     fromMe: false,
     desc: "Get detailed group information",
     type: "group",
+    groupOnly: true,
   },
   async (message, conn) => {
     try {
-      if (!message.isGroup) {
-        return await conn.sendMessage(message.from, {
-          text: "⚠️ This command can only be used in groups!"
-        });
-      }
+      const groupMetadata = await getGroupMeta(conn, message.from);
+      const lidUsers = groupMetadata.participants.filter((p) => isLidUser(p.id));
+      const pnUsers = groupMetadata.participants.filter((p) => isPnUser(p.id));
 
-      const groupMetadata = await conn.groupMetadata(message.from);
-      
-      // Build group info message
-      let info = `*📋 GROUP INFORMATION*\n\n`;
-      info += `*Name:* ${groupMetadata.subject}\n`;
-      info += `*Group ID:* ${groupMetadata.id}\n`;
-      info += `*Created:* ${new Date(groupMetadata.creation * 1000).toLocaleDateString()}\n`;
-      
-      // Owner info (with LID/PN support)
-      if (groupMetadata.owner) {
-        info += `\n*👑 Owner:*\n`;
-        info += `• ID: ${groupMetadata.owner}\n`;
-        
-        // In v7.x, owner is LID and ownerPn is the phone number
-        if (groupMetadata.ownerPn) {
-          info += `• Phone: ${groupMetadata.ownerPn.split("@")[0]}\n`;
-        }
-        
-        info += `• Type: ${isLidUser(groupMetadata.owner) ? "LID" : "PN"}\n`;
-      }
-      
-      // Description owner (if different from group owner)
-      if (groupMetadata.descOwner && groupMetadata.descOwner !== groupMetadata.owner) {
-        info += `\n*📝 Description Owner:*\n`;
-        info += `• ID: ${groupMetadata.descOwner}\n`;
-        
-        if (groupMetadata.descOwnerPn) {
-          info += `• Phone: ${groupMetadata.descOwnerPn.split("@")[0]}\n`;
-        }
-      }
-      
-      // Participants statistics
-      const participants = groupMetadata.participants;
-      const admins = participants.filter(p => p.admin === "admin" || p.admin === "superadmin");
-      const superAdmins = participants.filter(p => p.admin === "superadmin");
-      const regularMembers = participants.filter(p => !p.admin);
-      
-      // Count LID vs PN users
-      const lidUsers = participants.filter(p => isLidUser(p.id));
-      const pnUsers = participants.filter(p => isPnUser(p.id));
-      
-      info += `\n*👥 Members:*\n`;
-      info += `• Total: ${participants.length}\n`;
-      info += `• Super Admins: ${superAdmins.length}\n`;
-      info += `• Admins: ${admins.length - superAdmins.length}\n`;
-      info += `• Regular: ${regularMembers.length}\n`;
-      
+      let info = formatGroupInfo(groupMetadata);
       info += `\n*🆔 Identifier Types:*\n`;
       info += `• LID Users: ${lidUsers.length}\n`;
       info += `• PN Users: ${pnUsers.length}\n`;
-      
-      // Group settings
-      info += `\n*⚙️ Settings:*\n`;
-      info += `• Announce: ${groupMetadata.announce ? "Only Admins" : "All Members"}\n`;
-      info += `• Restrict: ${groupMetadata.restrict ? "Only Admins" : "All Members"}\n`;
-      
-      // Description
-      if (groupMetadata.desc) {
-        info += `\n*📄 Description:*\n${groupMetadata.desc}\n`;
-      }
 
-      await conn.sendMessage(message.from, { text: info });
-
+      await sendMessage(conn, message.from, info);
     } catch (error) {
       console.error("Error in groupinfo command:", error);
-      await conn.sendMessage(message.from, {
-        text: "❌ Failed to get group information."
-      });
+      await replyFail(conn, message, "Failed to get group information.");
     }
   }
 );
@@ -171,55 +123,33 @@ command(
 command(
   {
     pattern: "promote",
-    fromMe: true,
+    fromMe: false,
     desc: "Promote a member to admin (mention or reply)",
     type: "group",
+    groupOnly: true,
+    adminOnly: true,
+    botAdminRequired: true,
   },
   async (message, conn) => {
     try {
-      if (!message.isGroup) {
-        return await conn.sendMessage(message.from, {
-          text: "⚠️ This command can only be used in groups!"
-        });
-      }
-
-      // Get user to promote (from quoted message or mentions)
-      let targetUser = null;
-      
-      if (message.quoted) {
-        // If replying to a message, promote that user
-        const quotedKey = message.message.contextInfo?.quotedMessage;
-        const quotedParticipant = message.message.contextInfo?.participant;
-        targetUser = quotedParticipant;
-      } else if (message.message.contextInfo?.mentionedJid?.length > 0) {
-        // If mentioning someone, promote them
-        targetUser = message.message.contextInfo.mentionedJid[0];
-      }
-
+      const targetUser = resolveTargetUser(message) || getMentions(message)[0];
       if (!targetUser) {
-        return await conn.sendMessage(message.from, {
-          text: "⚠️ Please mention a user or reply to their message.\n\n*Usage:* `promote @user` or reply with `promote`"
-        });
+        return await sendError(conn, message.from, USAGE_HINTS.promote);
       }
 
-      // Promote the user (works with both LID and PN)
-      await conn.groupParticipantsUpdate(
-        message.from,
-        [targetUser],
-        "promote"
-      );
-
-      const displayId = targetUser.split("@")[0];
-      await conn.sendMessage(message.from, {
-        text: `✅ Successfully promoted @${displayId} to admin!`,
-        mentions: [targetUser]
+      await withTyping(conn, message.from, async () => {
+        await conn.groupParticipantsUpdate(message.from, [targetUser], "promote");
+        groupCache.delete(message.from);
+        await replyOk(
+          conn,
+          message,
+          `Promoted @${displayId(targetUser)} to admin!`,
+          { mentions: [targetUser] }
+        );
       });
-
     } catch (error) {
       console.error("Error in promote command:", error);
-      await conn.sendMessage(message.from, {
-        text: "❌ Failed to promote user. Make sure you have admin permissions."
-      });
+      await replyFail(conn, message, "Failed to promote user.");
     }
   }
 );
@@ -228,52 +158,33 @@ command(
 command(
   {
     pattern: "demote",
-    fromMe: true,
+    fromMe: false,
     desc: "Demote an admin to member (mention or reply)",
     type: "group",
+    groupOnly: true,
+    adminOnly: true,
+    botAdminRequired: true,
   },
   async (message, conn) => {
     try {
-      if (!message.isGroup) {
-        return await conn.sendMessage(message.from, {
-          text: "⚠️ This command can only be used in groups!"
-        });
-      }
-
-      // Get user to demote
-      let targetUser = null;
-      
-      if (message.quoted) {
-        const quotedParticipant = message.message.contextInfo?.participant;
-        targetUser = quotedParticipant;
-      } else if (message.message.contextInfo?.mentionedJid?.length > 0) {
-        targetUser = message.message.contextInfo.mentionedJid[0];
-      }
-
+      const targetUser = resolveTargetUser(message) || getMentions(message)[0];
       if (!targetUser) {
-        return await conn.sendMessage(message.from, {
-          text: "⚠️ Please mention a user or reply to their message.\n\n*Usage:* `demote @user` or reply with `demote`"
-        });
+        return await sendError(conn, message.from, USAGE_HINTS.demote);
       }
 
-      // Demote the user (works with both LID and PN)
-      await conn.groupParticipantsUpdate(
-        message.from,
-        [targetUser],
-        "demote"
-      );
-
-      const displayId = targetUser.split("@")[0];
-      await conn.sendMessage(message.from, {
-        text: `✅ Successfully demoted @${displayId} to member!`,
-        mentions: [targetUser]
+      await withTyping(conn, message.from, async () => {
+        await conn.groupParticipantsUpdate(message.from, [targetUser], "demote");
+        groupCache.delete(message.from);
+        await replyOk(
+          conn,
+          message,
+          `Demoted @${displayId(targetUser)} to member!`,
+          { mentions: [targetUser] }
+        );
       });
-
     } catch (error) {
       console.error("Error in demote command:", error);
-      await conn.sendMessage(message.from, {
-        text: "❌ Failed to demote user. Make sure you have admin permissions."
-      });
+      await replyFail(conn, message, "Failed to demote user.");
     }
   }
 );
@@ -285,56 +196,32 @@ command(
     fromMe: false,
     desc: "List all group admins",
     type: "group",
+    groupOnly: true,
   },
   async (message, conn) => {
     try {
-      if (!message.isGroup) {
-        return await conn.sendMessage(message.from, {
-          text: "⚠️ This command can only be used in groups!"
-        });
-      }
+      const groupMetadata = await getGroupMeta(conn, message.from);
+      const adminsList = getAdmins(groupMetadata);
 
-      const groupMetadata = await conn.groupMetadata(message.from);
-      const participants = groupMetadata.participants;
-      
-      // Filter admins and super admins
-      const admins = participants.filter(p => p.admin === "admin" || p.admin === "superadmin");
-      
-      if (admins.length === 0) {
-        return await conn.sendMessage(message.from, {
-          text: "⚠️ No admins found in this group."
-        });
+      if (adminsList.length === 0) {
+        return await sendError(conn, message.from, "No admins found in this group.");
       }
 
       let adminList = `*👑 GROUP ADMINS*\n\n`;
       adminList += `*Group:* ${groupMetadata.subject}\n`;
-      adminList += `*Total Admins:* ${admins.length}\n\n`;
-      
+      adminList += `*Total Admins:* ${adminsList.length}\n\n`;
+
       const mentionIds = [];
-      
-      admins.forEach((admin, index) => {
-        const id = admin.id;
-        mentionIds.push(id);
-        
+      adminsList.forEach((admin, index) => {
+        mentionIds.push(admin.id);
         const role = admin.admin === "superadmin" ? "👑 Super Admin" : "🛡️ Admin";
-        const displayId = id.split("@")[0];
-        
-        adminList += `${index + 1}. @${displayId} - ${role}\n`;
+        adminList += `${index + 1}. @${displayId(admin)} - ${role}\n`;
       });
 
-      await conn.sendMessage(
-        message.from,
-        {
-          text: adminList,
-          mentions: mentionIds
-        }
-      );
-
+      await sendMessage(conn, message.from, adminList, { mentions: mentionIds });
     } catch (error) {
       console.error("Error in admins command:", error);
-      await conn.sendMessage(message.from, {
-        text: "❌ Failed to get admin list."
-      });
+      await replyFail(conn, message, "Failed to get admin list.");
     }
   }
 );

@@ -1,4 +1,5 @@
 const MIME_TYPE_MAP = {
+    conversation: "text",
     imageMessage: "image",
     videoMessage: "video",
     stickerMessage: "sticker",
@@ -9,6 +10,15 @@ const MIME_TYPE_MAP = {
     viewOnceMessageV2Extension: "image",
     extendedTextMessage: "text",
 };
+
+const WRAPPER_KEYS = [
+    "ephemeralMessage",
+    "viewOnceMessage",
+    "viewOnceMessageV2",
+    "viewOnceMessageV2Extension",
+    "documentWithCaptionMessage",
+    "templateMessage",
+];
 
 /**
  * Gets the message type and MIME type from a message object.
@@ -28,45 +38,93 @@ function getMessageMimeType(message) {
 }
 
 /**
+ * Unwrap nested WA message wrappers to the inner content object
+ */
+function unwrapMessage(msg) {
+    let current = msg;
+    for (let i = 0; i < 4 && current; i++) {
+        let unwrapped = false;
+        for (const key of WRAPPER_KEYS) {
+            if (current[key]?.message) {
+                current = current[key].message;
+                unwrapped = true;
+                break;
+            }
+        }
+        if (!unwrapped) break;
+    }
+    return current;
+}
+
+/**
  * Extracts quoted message content from context info.
- * @param {object} contextInfo - The context info object.
- * @returns {object|null} The quoted message content or null.
+ * Returns a rich object with type + raw for media downloads.
  */
 function extractQuotedMessage(contextInfo) {
     if (!contextInfo?.quotedMessage) return null;
 
-    const { key: quotedKey } = getMessageMimeType(contextInfo.quotedMessage);
-    const quotedNest = contextInfo.quotedMessage[quotedKey];
+    const unwrapped = unwrapMessage(contextInfo.quotedMessage);
+    const { key: quotedKey, mime } = getMessageMimeType(unwrapped);
+    if (mime === "unknown" || !quotedKey) return null;
 
-    if (!quotedNest?.message) return null;
+    let content = unwrapped[quotedKey];
 
-    const { key: nestKey } = getMessageMimeType(quotedNest.message);
-    return quotedNest.message[nestKey] || null;
+    // Nested wrappers (e.g. documentWithCaptionMessage)
+    if (content?.message) {
+        const nested = unwrapMessage(content.message);
+        const { key: nestKey, mime: nestMime } = getMessageMimeType(nested);
+        if (nestMime !== "unknown" && nestKey) {
+            content = nested[nestKey];
+            return normalizeQuoted(content, nestMime, nestKey, nested);
+        }
+    }
+
+    return normalizeQuoted(content, mime, quotedKey, unwrapped);
+}
+
+function normalizeQuoted(content, mime, messageTypeKey, raw) {
+    if (mime === "text") {
+        const text =
+            typeof content === "string"
+                ? content
+                : content?.text || content?.caption || "";
+        return {
+            type: "text",
+            text,
+            caption: content?.caption,
+            messageTypeKey,
+            raw,
+            mimetype: content?.mimetype,
+        };
+    }
+
+    return {
+        ...(typeof content === "object" && content ? content : {}),
+        type: mime,
+        text: content?.caption || content?.text || "",
+        caption: content?.caption,
+        mimetype: content?.mimetype,
+        messageTypeKey,
+        raw,
+    };
 }
 
 /**
  * Determines sender information with LID/PN support.
- * @param {object} key - The message key object.
- * @param {boolean} isGroup - Whether the message is from a group.
- * @param {object} conn - The Baileys connection object.
- * @returns {object} Sender information object.
  */
 function getSenderInfo(key, isGroup, conn) {
     const isBotMessage = key.fromMe && !key.participant;
 
     if (isGroup) {
-        // Group messages
         const participant = key.participant || null;
         const participantAlt = key.participantAlt || null;
 
-        // For bot messages, use bot's ID; otherwise use participant
         const sender = isBotMessage
             ? conn.user?.id
             : (participantAlt || participant);
 
         return { participant, participantAlt, sender, isBotMessage };
     } else {
-        // Direct messages
         const participant = key.remoteJid;
         const participantAlt = key.remoteJidAlt || null;
 
@@ -81,65 +139,50 @@ function getSenderInfo(key, isGroup, conn) {
 /**
  * Serializes a Baileys message object to make it easier to work with.
  * Updated for Baileys 7.x.x with LID support.
- * 
- * LID (Lidded ID) vs PN (Phone Number):
- * - LID: Format like '218837307916530@lid' - privacy-focused identifier
- * - PN: Format like '918113921898@s.whatsapp.net' - traditional phone number
- * - remoteJidAlt: Alternate identifier for DMs (PN if main is LID)
- * - participantAlt: Alternate identifier for group participants
- * 
- * @param {object} message - The raw Baileys message object.
- * @param {object} conn - The Baileys connection object.
- * @returns {Promise<object|null>} The serialized message object.
  */
 async function serialize(message, conn) {
-    // Early validation
     if (!message?.key?.remoteJid || !message?.message) return null;
 
     const { key, message: msgContent, pushName } = message;
 
-    // Get message type and MIME
-    const { key: messageTypeKey, mime: messageMime } = getMessageMimeType(msgContent);
+    const unwrapped = unwrapMessage(msgContent);
+    const { key: messageTypeKey, mime: messageMime } = getMessageMimeType(unwrapped);
     if (messageMime === "unknown") return null;
 
-    // Extract message content
-    const messageContent = msgContent[messageTypeKey];
+    const messageContent = unwrapped[messageTypeKey];
     const isGroup = key.remoteJid.endsWith("@g.us");
 
-    // Chat identifiers with LID/PN support
     const from = key.remoteJid;
     const fromAlt = key.remoteJidAlt || null;
 
-    // Extract sender information
     const { participant, participantAlt, sender, isBotMessage } = getSenderInfo(key, isGroup, conn);
 
-    // Extract quoted message
-    const quoted = extractQuotedMessage(messageContent?.contextInfo);
+    const contextInfo = messageContent?.contextInfo;
+    const quoted = extractQuotedMessage(contextInfo);
 
-    // Extract message body text
-    const body = messageContent?.text || messageContent?.caption || "";
+    const body = messageTypeKey === "conversation"
+        ? messageContent
+        : (messageContent?.text || messageContent?.caption || "");
 
     return {
-        // Core identifiers
         key,
         id: key.id,
         pushName: pushName || "",
-        // Chat info
         isGroup,
         from,
         fromAlt,
-        // Message content
         type: messageMime,
         message: messageContent,
+        messageTypeKey,
+        rawMessage: unwrapped,
         body,
         quoted,
-        // Sender info (with LID/PN support)
         participant,
         participantAlt,
         sender,
-        // Bot detection
         isBotMessage,
     };
 }
 
 export { serialize };
+

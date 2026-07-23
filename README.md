@@ -1,432 +1,304 @@
-# X-Asena Bot
+# X-Asena
 
-> 🚧 **Active Development Branch: `baileys_7`** 🚧
-> 
-> This branch represents ongoing development work to modernize X-Asena with the latest Baileys library (v7) and production-ready database architecture.
+Open-source WhatsApp bot built on [Baileys](https://github.com/WhiskeySockets/Baileys) **7.0.0-rc13**.
 
-X-Asena is a powerful and versatile WhatsApp bot built using Node.js and the Baileys library. This bot offers a wide range of features and capabilities, making it an excellent choice for both personal and commercial use cases.
+Optimized for a lean Node process with SQLite (or Postgres) auth, a dedicated **system log group** for onboarding and diagnostics, and an optional **enterprise control plane** (audit, feature flags, RBAC, policies, metrics, backups).
 
-## ⚡ What's New in This Branch
+| | |
+|---|---|
+| **Runtime** | Node.js ≥ 20 |
+| **Module** | ESM (`"type": "module"`) |
+| **Auth** | better-sqlite3 (default) or Postgres |
+| **Prefix** | `#` |
 
-This development branch introduces **major architectural improvements** for production deployments:
+---
 
-### 🔐 Database-Based Authentication State
-- **Replaces file-based auth** with a robust database solution
-- **Production-ready** with retry logic, mutex locks, and error handling
-- **Simplified API** - direct drop-in replacement for `useMultiFileAuthState`
-- **Works with SQLite** (development) and **PostgreSQL** (production)
-- **Thread-safe** operations for multi-instance deployments
+## Features
 
-### 📦 Key Improvements
-- ✅ Upgraded to **Baileys v7** (latest)
-- ✅ Database authentication state for scalability
-- ✅ Enhanced error handling and retry mechanisms
-- ✅ Better buffer serialization for crypto operations
-- ✅ Atomic database operations with proper locking
-- ✅ Comprehensive logging and debugging
+- **Messaging** — command registry, LID-aware groups, public/private mode, sudo list
+- **Media** — stickers + EXIF, YouTube (`youtubei.js`), converters, TTS, social downloaders (best-effort)
+- **Moderation** — welcome/goodbye, antilink, antispam, warn/mute/kick, per-group plugin toggles
+- **Productivity** — notes, reminders, polls
+- **Onboarding** — auto-created system log group + `#setup` wizard (no self-DM)
+- **Ops** — audit log, feature flags, RBAC, global policies, job queue, metrics alerts, session backup, optional admin HTTP
 
-[![DigitalOcean Referral Badge](https://web-platforms.sfo2.cdn.digitaloceanspaces.com/WWW/Badge%203.svg)](https://www.digitalocean.com/?refcode=9db4c65bb8ee&utm_campaign=Referral_Invite&utm_medium=Referral_Program&utm_source=badge)
+---
 
-🚀 Deploy your X-Asena Bot on DigitalOcean and get $200 in free credits! Perfect for production deployments with our new database-backed authentication!
+## Requirements
 
-## 📑 Table of Contents
-
-- [Why Database Authentication?](#why-database-authentication)
-- [Installation](#installation)
-  - [Prerequisites](#prerequisites)
-  - [Quick Start](#quick-start)
-- [New Architecture](#new-architecture)
-  - [Database Authentication State](#database-authentication-state)
-  - [Benefits Over File-Based Storage](#benefits-over-file-based-storage)
-- [Development Status](#development-status)
-- [Usage](#usage)
-  - [Creating a Plugin](#creating-a-plugin)
-  - [Sending Messages](#sending-messages)
-- [External Plugins](#external-plugins)
-- [Migration Guide](#migration-guide)
-- [Community and Support](#community-and-support)
-- [Contributing](#contributing)
-- [Documentation](#documentation)
-- [Credits](#credits)
-- [License](#license)
-
-## 🤔 Why Database Authentication?
-
-### The Problem with File-Based Storage
-The original Baileys `useMultiFileAuthState` stores authentication data in files, which creates issues:
-- ❌ Doesn't work well in containerized environments (Docker, Kubernetes)
-- ❌ Difficult to scale horizontally
-- ❌ No built-in backup/restore mechanisms
-- ❌ Race conditions in multi-instance setups
-- ❌ File system dependencies
-
-### Our Database Solution
-We've implemented a **production-ready database authentication state** that:
-- ✅ **Scales effortlessly** - works in Docker, Kubernetes, serverless
-- ✅ **Thread-safe** - mutex locks prevent race conditions
-- ✅ **Reliable** - automatic retry with exponential backoff
-- ✅ **Flexible** - supports SQLite, PostgreSQL, MySQL
-- ✅ **Maintainable** - easy backup, restore, and debugging
-- ✅ **Compatible** - drop-in replacement for file-based auth
-
-### Why This Matters
-This architectural change makes X-Asena suitable for:
-- 🏢 **Enterprise deployments** with multiple instances
-- ☁️ **Cloud platforms** (AWS, GCP, Azure, DigitalOcean)
-- 🐳 **Containerized environments** (Docker, Kubernetes)
-- 📈 **Scalable architectures** with load balancing
-- 🔄 **High availability** setups with redundancy
-
-## 🚀 Installation
-
-### Prerequisites
-
-Before installing X-Asena, ensure you have:
-
-- **Node.js** (v18 or higher)
-- **FFmpeg** (for media processing)
-- **Git** (for cloning the repository)
-
-### Quick Start
+- [Node.js](https://nodejs.org/) **20+**
+- **FFmpeg** on `PATH` (needed for `#ytmp3`, `#play`, `#tomp3`, video stickers, `#attp`)
+- WhatsApp account (multi-device)
 
 ```bash
-# Clone the repository (baileys_7 branch)
-git clone -b baileys_7 https://github.com/Neeraj-x0/X-Asena.git
-cd X-Asena
-
-# Install dependencies
-npm install
-
-# Install additional required packages
-npm install sqlite3 async-mutex
-
-# Optional: Install PM2 for process management
-npm install pm2 -g
-
-# Start the bot
-npm start
-```
-
-### First Run
-On the first run:
-1. The bot will create a new database (`database.db`)
-2. A QR code will be displayed in the terminal
-3. Scan it with WhatsApp to link your device
-4. Authentication data is automatically saved to the database
-
-
-## 🏗️ New Architecture
-
-### Database Authentication State
-
-The new authentication system is built around `useMultiDbAuthState()`:
-
-```javascript
-// Old file-based approach
-const { state, saveCreds } = await useMultiFileAuthState('./auth_folder');
-
-// New database approach (same interface!)
-const { state, saveCreds } = await useMultiDbAuthState();
-```
-
-**Key Features:**
-
-1. **Automatic Retry Logic**
-   - 3 retry attempts with exponential backoff
-   - Smart error categorization
-   - Graceful degradation on failures
-
-2. **Thread-Safe Operations**
-   - Per-key mutex locks
-   - No race conditions
-   - Safe for concurrent access
-
-3. **Enhanced Buffer Handling**
-   - Proper serialization of crypto buffers
-   - Support for Uint8Array, Buffer, and plain objects
-   - Base64 encoding for efficient storage
-
-4. **Database Optimizations**
-   - Atomic `upsert` operations
-   - Indexed queries for fast lookups
-   - Connection pooling via Sequelize
-
-5. **Proto Message Support**
-   - Full Baileys protocol compatibility
-   - Automatic proto conversion
-   - App-state-sync-key handling
-
-### Benefits Over File-Based Storage
-
-| Feature | File-Based | Database-Based |
-|---------|-----------|----------------|
-| **Containerization** | ❌ Requires volume mounts | ✅ Works seamlessly |
-| **Horizontal Scaling** | ❌ File conflicts | ✅ Built-in support |
-| **Backup/Restore** | ⚠️ Manual process | ✅ Database-level tools |
-| **Multi-Instance** | ❌ Race conditions | ✅ Thread-safe locks |
-| **Cloud Deployment** | ⚠️ Complicated | ✅ Simple and reliable |
-| **Error Recovery** | ❌ Manual intervention | ✅ Automatic retry |
-| **Debugging** | ⚠️ File inspection | ✅ SQL queries |
-| **Performance** | ⚠️ File I/O overhead | ✅ Optimized queries |
-
-## 🔨 Development Status
-
-This branch is under **active development**. Here's what's been done and what's coming:
-
-### ✅ Completed
-
-- [x] Implemented database authentication state
-- [x] Added retry mechanism with exponential backoff
-- [x] Thread-safe operations with mutex locks
-- [x] Enhanced buffer serialization
-- [x] Atomic database operations
-- [x] Comprehensive error handling
-- [x] SQLite and PostgreSQL support
-- [x] Documentation and examples
-
-### 🚧 In Progress
-- [ ] Upgrading to Baileys v7
-- [ ] Plugin system migration to new architecture
-- [ ] Enhanced message handling
-- [ ] Media optimization for database storage
-- [ ] Performance benchmarking
-- [ ] Integration tests
-
-### 📋 Planned
-- [ ] Redis caching layer
-- [ ] Multi-device support
-- [ ] Enhanced plugin API
-- [ ] Web dashboard for management
-- [ ] Docker compose setup
-- [ ] Kubernetes deployment manifests
-
-
-## 🔄 Migration Guide
-
-### From Main Branch to baileys_7
-
-If you're migrating from the main branch:
-
-1. **Backup your data**
-   ```bash
-   cp -r auth_folder auth_folder_backup
-   ```
-
-2. **Pull the new branch**
-   ```bash
-   git fetch origin baileys_7
-   git checkout baileys_7
-   ```
-
-3. **Install new dependencies**
-   ```bash
-   npm install
-   npm install sqlite3 async-mutex
-   ```
-
-4. **Clear old auth and restart**
-   ```bash
-   rm -rf auth_folder
-   npm start
-   # Scan QR code again
-   ```
-
-The database will be created automatically on first run!
-
-### Configuration Changes
-
-Update your `config.js` if needed:
-```javascript
-// The DATABASE_URL can point to SQLite or PostgreSQL
-DATABASE_URL: process.env.DATABASE_URL || "./database.db"
-```
-
-For PostgreSQL:
-```javascript
-DATABASE_URL: "postgresql://user:password@localhost:5432/xasena"
-```
-
-## 🤝 Community and Support
-
-Join our WhatsApp group for support, discussions, and updates:
-
-[![JOIN WHATSAPP GROUP](https://raw.githubusercontent.com/Neeraj-x0/Neeraj-x0/main/photos/suddidina-join-whatsapp.png)](https://chat.whatsapp.com/DJYrdBENyX33MRppEFPxV6)
-
-### Getting Help
-- 💬 **WhatsApp Group**: Quick community support
-- 🐛 **GitHub Issues**: Bug reports and feature requests
-- 📖 **Wiki**: Detailed documentation (coming soon)
-- 💡 **Discussions**: Ideas and questions
-
-## 🌟 Contributing
-
-We welcome contributions, especially during **Hacktoberfest 2024**!
-
-### How to Contribute
-
-1. **Fork the repository**
-2. **Create a feature branch**
-   ```bash
-   git checkout -b feature/amazing-feature
-   ```
-3. **Make your changes**
-4. **Test thoroughly**
-   ```bash
-   npm start
-   ```
-5. **Commit your changes**
-   ```bash
-   git commit -m "Add amazing feature"
-   ```
-6. **Push to your fork**
-   ```bash
-   git push origin feature/amazing-feature
-   ```
-7. **Open a Pull Request**
-
-### Contribution Areas
-
-- 🐛 Bug fixes (check issues labeled `bug`)
-- ✨ New features (check issues labeled `enhancement`)
-- 📝 Documentation improvements
-- 🧪 Writing tests
-- 🎨 UI/UX improvements
-- 🌐 Translations
-
-### Development Guidelines
-
-- Follow existing code style
-- Write meaningful commit messages
-- Test your changes before submitting
-- Update documentation as needed
-- Be respectful and collaborative
-
-## 📚 Documentation
-
-Detailed documentation is available in the following files:
-
-- **[AUTH_STATE_IMPROVEMENTS.md](./AUTH_STATE_IMPROVEMENTS.md)** - Technical deep-dive into the new auth system
-- **[SIMPLIFIED_AUTH_STATE.md](./SIMPLIFIED_AUTH_STATE.md)** - Quick guide and API reference
-- **[example-auth-usage.js](./example-auth-usage.js)** - Complete working example
-
-### API Reference
-
-See the documentation files for:
-- Database schema details
-- Error handling strategies
-- Performance considerations
-- Deployment best practices
-- Troubleshooting guide
-
-## 💡 Example Projects
-
-Check out these examples:
-
-1. **Basic Bot** - `example-auth-usage.js`
-2. **Plugin Development** - `src/plugins/` directory
-3. **Custom Commands** - See existing plugins for reference
-
-## 🔧 Troubleshooting
-
-### Common Issues
-
-**Issue: Database locked errors**
-```bash
-# Solution: Automatic retry handles this, but if persistent:
-rm database.db
-npm start
-```
-
-**Issue: QR code not showing**
-```bash
-# Solution: Install qrcode-terminal
-npm install qrcode-terminal
-```
-
-**Issue: "No existing credentials found"**
-```
-# This is normal on first run - just scan the QR code
-```
-
-**Issue: Connection keeps dropping**
-```bash
-# Check your internet connection and try:
-npm start
-```
-
-### Debug Mode
-
-Enable debug logging:
-```javascript
-// In config.js
-LOGS: true
-```
-
-## 🎯 Roadmap
-
-### Short Term (v4.1)
-- [ ] Stabilize database authentication
-- [ ] Complete plugin migration
-- [ ] Add integration tests
-- [ ] Docker support
-
-### Medium Term (v4.2)
-- [ ] Redis caching
-- [ ] Web dashboard
-- [ ] Multi-device support
-- [ ] Enhanced media handling
-
-### Long Term (v4.3)
-- [ ] Microservices architecture
-- [ ] Kubernetes deployment
-- [ ] Advanced analytics
-
-## 🏆 Credits
-
-**X-Asena** is created and maintained by:
-- **Neeraj-X0** - Current maintainer 
-- **Contributors** - All the amazing people who contribute to this project
-
-Special thanks to:
-- [WhiskeySockets/Baileys](https://github.com/WhiskeySockets/Baileys) - The WhatsApp Web API library
-- The open-source community
-
-## 📄 License
-
-X-Asena is licensed under the **MIT License**:
-
-```
-MIT License
-
-Copyright (c) 2023-2025 X-Electra, Neeraj-X0
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+# FFmpeg examples
+choco install ffmpeg          # Windows
+brew install ffmpeg           # macOS
+sudo apt install ffmpeg       # Debian/Ubuntu
 ```
 
 ---
 
-<div align="center">
+## Install
 
-### ⭐ Star this repository if you find it useful!
+```bash
+git clone https://github.com/Neeraj-x0/X-Asena.git
+cd X-Asena
+npm install
+```
 
-**Made with ❤️ by the X-Asena Team**
+Create a `.env` in the project root (see [Configuration](#configuration)), then:
 
-[Report Bug](https://github.com/Neeraj-x0/X-Asena/issues) · [Request Feature](https://github.com/Neeraj-x0/X-Asena/issues) · [Join Community](https://chat.whatsapp.com/DJYrdBENyX33MRppEFPxV6)
+```bash
+npm start
+# development (auto-reload):
+npm run dev
+```
 
-</div>
+### Login
+
+1. **QR (default)** — scan the QR printed in the terminal with WhatsApp → *Linked devices*.
+2. **Pairing code** — set `PAIRING_NUMBER` to your number with country code (digits only, e.g. `919876543210`), restart, and enter the code shown in the terminal on your phone.
+
+Session data is stored in `./database.db` by default (or in Postgres when `DATABASE_URL` is a Postgres URL).
+
+---
+
+## Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OWNER_NUMBER` | _(empty)_ | Owner phone(s), comma-separated, country code, no `+`. **Required** to auto-create the system log group. |
+| `SUDO` | _(empty)_ | Extra privileged numbers (merged with runtime `#sudo`) |
+| `BOT_MODE` | `public` | First-boot seed only: `public` \| `private` |
+| `BOT_LANG` | `en` | First-boot language: `en` \| `id` \| `hi` |
+| `DATABASE_URL` | `./database.db` | SQLite file path, or `postgres://` / `postgresql://` URL |
+| `PAIRING_NUMBER` | _(empty)_ | Enable pairing-code login instead of QR |
+| `STICKER_PACKNAME` | `X-Asena` | Default sticker pack name |
+| `STICKER_AUTHOR` | `X-Asena` | Default sticker author |
+| `REMOVEBG_API_KEY` | _(empty)_ | API key for `#removebg` |
+| `LOG_LEVEL` | `warn` | App log level: `silent` \| `error` \| `warn` \| `info` \| `debug` |
+| `BAILEYS_LOG_LEVEL` | `silent` | Baileys / pino level |
+| `JOB_CONCURRENCY` | `1` | Parallel media jobs (YouTube downloads) |
+| `ERROR_ALERT_THRESHOLD` | `8` | Errors per minute before alerting the system group |
+| `TENANT_ID` | `default` | Label for metrics / backups |
+| `ADMIN_HTTP_PORT` | _(off)_ | Enable ops HTTP when set (e.g. `8787`) |
+| `ADMIN_HTTP_HOST` | `127.0.0.1` | Bind address for admin HTTP |
+| `ADMIN_HTTP_TOKEN` | _(required if port set)_ | Bearer token for protected endpoints |
+
+Example `.env`:
+
+```env
+OWNER_NUMBER=919876543210
+BOT_MODE=public
+BOT_LANG=en
+LOG_LEVEL=warn
+# PAIRING_NUMBER=919876543210
+# DATABASE_URL=postgresql://user:pass@host:5432/xasena
+# ADMIN_HTTP_PORT=8787
+# ADMIN_HTTP_TOKEN=change-me
+```
+
+### Auth backends
+
+- **No Postgres URL** → `better-sqlite3` with WAL (default). Path from `DATABASE_URL` or `./database.db`.
+- **Postgres URL** → Sequelize Postgres. Settings (`BotKV`) use the same database.
+
+If you upgrade from an older Sequelize + `sqlite3` install and decryption fails, delete `database.db` (and `-wal` / `-shm` if present) and link again.
+
+---
+
+## First run
+
+1. Set `OWNER_NUMBER` and start the bot.
+2. After connect, the bot creates a group named **`X-Asena · System`** and adds the owner.
+3. Open that group and run `#setup` (mode → language → sticker pack).
+4. In normal groups, admins can run `#groupsetup recommended`.
+
+Manual fallback if auto-create fails: create a group, add the bot and yourself, then `#setlog` and `#setup`.
+
+**Why a log group?** WhatsApp bots should not rely on DMing their own number. Setup, stack traces, and ops alerts stay in the system group. Other chats only receive short, user-safe error messages.
+
+| Command | Scope | Description |
+|---------|--------|-------------|
+| `#createlog` | Owner | Create or recreate the system group |
+| `#setlog` | Owner, in a group | Mark the current group as the system log group |
+| `#setup` | Privileged, **log group only** | Onboarding wizard |
+
+---
+
+## Commands
+
+Default prefix: `#`. Use `#menu` for the live list, or `#help <command>` for one command.
+
+### Core
+
+| Command | Description |
+|---------|-------------|
+| `#menu` / `#help` | Command list |
+| `#help <cmd>` | Help for one command |
+| `#ping` | Latency check |
+| `#info` | Message / chat info |
+| `#status` | Health (extra detail for owner/sudo) |
+| `#lang` | Show or set language (`en` \| `id` \| `hi`) |
+
+### Access
+
+| Command | Who | Description |
+|---------|-----|-------------|
+| `#mode` / `#mode public\|private` | Owner/sudo | Bot access mode |
+| `#sudo add\|del\|list` | Owner (mutations) | Manage sudo users |
+
+- **public** — anyone can use normal commands  
+- **private** — owner + sudo only (others are silently ignored)
+
+### Groups
+
+| Command | Description |
+|---------|-------------|
+| `#mention` | Mention everyone |
+| `#tagall` / `#notify` | Tag / alert members |
+| `#groupinfo` / `#admins` | Group details |
+| `#promote` / `#demote` | Change admin role |
+| `#groupsetup recommended\|minimal\|off` | Quick moderation preset |
+
+### Moderation (group admins)
+
+| Command | Description |
+|---------|-------------|
+| `#welcome` / `#goodbye` | Toggle or set templates (`@user`, `@group`, `@count`) |
+| `#antilink` / `#antispam` | Toggle guards |
+| `#groupsettings` | Show group flags |
+| `#warn` / `#unwarn` / `#warns` | Warn system (kick at limit) |
+| `#mute` / `#unmute` / `#kick` | Mute or remove members |
+| `#disable` / `#enable` / `#plugins` | Per-group command toggles |
+
+### Stickers & media
+
+| Command | Description |
+|---------|-------------|
+| `#sticker` / `#s` | Image/video → sticker + EXIF |
+| `#take` / `#steal` | Repack sticker EXIF |
+| `#toimg` | Sticker → PNG |
+| `#exif` | Set pack/author (privileged) |
+| `#yt` / `#ytmp3` / `#ytmp4` / `#play` | YouTube info / audio / video / search |
+| `#tomp3` / `#toururl` / `#url` | Convert or upload media |
+| `#quote` / `#fancy` / `#tts` / `#ttp` / `#attp` | Text / TTS tools |
+| `#removebg` | Background remove (needs `REMOVEBG_API_KEY`) |
+| `#ig` / `#tiktok` / `#fb` | Social download (best-effort; scrapers break often) |
+
+YouTube uses **`youtubei.js`** (no `yt-dlp`). Soft caps apply (~15 min audio / ~10 min video). Downloads are queued (`JOB_CONCURRENCY`).
+
+### Productivity
+
+| Command | Description |
+|---------|-------------|
+| `#note set\|get\|del\|list` | Personal notes |
+| `#remind <time> <text>` | Reminder (`30s`, `10m`, `2h`, `1d`) |
+| `#reminders` / `#cancelremind` | List / cancel |
+| `#poll Q \| A \| B` | Create a poll |
+
+### Enterprise / ops
+
+Prefer running these in the **system log group**.
+
+| Command | Description |
+|---------|-------------|
+| `#audit` | Recent privileged actions (`#audit clear` for owner) |
+| `#flag list` / `#flag <name> on\|off` | Feature flags / kill switches |
+| `#policy list` / `#policy <key> <value>` | Global policies (quiet hours, rate limits, …) |
+| `#role list` / `#role set @user admin` | RBAC (`owner` → `admin` → `mod` → `user`) |
+| `#backup` / `#backup full` | Export BotKV JSON (+ optional DB file) |
+| `#metrics` | Runtime counters and job queue |
+| `#broadcast <text>` | Owner: send to all groups |
+
+Useful flags: `media`, `ytdl`, `social`, `stickers`, `moderation`, `broadcast`, `maintenance` (locks the bot to owner/sudo).
+
+### Admin HTTP (optional)
+
+```env
+ADMIN_HTTP_PORT=8787
+ADMIN_HTTP_HOST=127.0.0.1
+ADMIN_HTTP_TOKEN=long-random-secret
+```
+
+| Endpoint | Auth | Description |
+|----------|------|-------------|
+| `GET /health` | None | Liveness, FFmpeg, setup, queue |
+| `GET /metrics` | Bearer token | JSON metrics |
+| `GET /metrics?format=prom` | Bearer token | Prometheus text |
+| `GET /audit` | Bearer token | Audit rows |
+| `GET /flags` | Bearer token | Feature flags |
+| `GET /policies` | Bearer token | Global policies |
+
+Send `Authorization: Bearer <ADMIN_HTTP_TOKEN>`.
+
+---
+
+## Architecture
+
+```text
+WhatsApp
+   │
+   ▼
+makeWASocket (lean: no full history, offline on connect)
+   │
+   ├─ group guards (mute / antilink / antispam)
+   ▼
+messageHandler
+   │  ACL → feature flags → policies → command
+   │  audit + metrics on sensitive actions
+   │
+   ├─ plugins/          commands
+   ├─ enterprise/       audit, flags, RBAC, policy, queue, metrics, backup, admin HTTP
+   ├─ database/         AuthState + BotKV (SQLite or Postgres)
+   └─ system log group  setup, stacks, alerts only
+```
+
+- **Socket:** no full history sync, no HQ link previews, `emitOwnEvents: false`, reconnect with backoff  
+- **Caches:** short TTL group metadata + message retry cache  
+- **Errors:** stacks and diagnostics → system log group only  
+
+---
+
+## Terminal shortcuts
+
+While the process is running:
+
+| Key | Action |
+|-----|--------|
+| `Q` | Logout and clear auth |
+| `R` | Restart process |
+| `A` | Wipe auth database (confirm with `Y`) |
+
+---
+
+## Troubleshooting
+
+| Problem | What to try |
+|---------|-------------|
+| No system group | Set `OWNER_NUMBER`, restart, or `#setlog` in a group you create |
+| `#ytmp3` / video sticker fails | Install FFmpeg and ensure it is on `PATH` |
+| Session decrypt errors after upgrade | Delete `database.db` (+ `-wal`/`-shm`), link again |
+| Social download fails | Expected often — scrapers break; treat as best-effort |
+| Bot ignores everyone | Check `#mode` — `private` limits use to owner/sudo |
+| Admin HTTP won’t start | Set both `ADMIN_HTTP_PORT` and `ADMIN_HTTP_TOKEN` |
+
+---
+
+## Scripts
+
+```bash
+npm start    # node index.js
+npm run dev  # nodemon index.js
+```
+
+---
+
+## License
+
+[MIT](LICENSE)
+
+---
+
+**Author:** [Neeraj](https://github.com/Neeraj-x0) · **Repo:** [Neeraj-x0/X-Asena](https://github.com/Neeraj-x0/X-Asena)
