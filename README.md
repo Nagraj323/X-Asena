@@ -47,7 +47,7 @@ cd X-Asena
 npm install
 ```
 
-Create a `.env` in the project root (see [Configuration](#configuration)), then:
+Create a `.env` in the project root (copy from [`.env.example`](.env.example)), then:
 
 ```bash
 npm start
@@ -298,6 +298,13 @@ npm run dev  # nodemon index.js
 ## License
 
 [MIT](LICENSE)
+
+## Community
+
+- [Contributing](CONTRIBUTING.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Security](SECURITY.md)
+- [Changelog](CHANGELOG.md)
 
 ---
 
