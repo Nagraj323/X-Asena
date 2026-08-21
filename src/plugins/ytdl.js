@@ -33,12 +33,13 @@ let ytClient = null;
 const STREAM_CLIENTS = ["IOS", "ANDROID", "TV", "MWEB"];
 
 const STREAM_HEADERS = {
-  "User-Agent":
-    "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)",
-  Accept: "*/*",
-  Origin: "https://www.youtube.com",
-  Referer: "https://www.youtube.com",
+  accept: "*/*",
+  origin: "https://www.youtube.com",
+  referer: "https://www.youtube.com",
+  DNT: "?1",
 };
+
+const CHUNK_BYTES = 10 * 1024 * 1024;
 
 async function getYt() {
   if (ytClient) return ytClient;
@@ -59,6 +60,9 @@ function friendlyYtError(err) {
   const msg = String(err?.message || err || "YouTube download failed.");
   if (/no valid url to decipher|streaming.?data|decipher|sabr/i.test(msg)) {
     return "YouTube blocked stream URLs for this IP/video. Try another video or again later.";
+  }
+  if (/stream fetch failed/i.test(msg)) {
+    return "YouTube refused the stream download (403/blocked). Try again in a bit.";
   }
   return msg;
 }
@@ -136,29 +140,108 @@ function pickMuxedFormat(formats, maxHeight = 720) {
   return pool[0];
 }
 
-async function fetchUrlToFile(url, ext) {
-  const filePath = createTempPath(ext);
-  const res = await fetch(url, { headers: STREAM_HEADERS, redirect: "follow" });
-  if (!res.ok) {
-    await safeUnlink(filePath);
-    throw new Error(`Stream fetch failed (${res.status}).`);
-  }
-  if (!res.body) {
-    await safeUnlink(filePath);
-    throw new Error("Empty stream body.");
-  }
-  await streamToFile(res.body, filePath);
-  return filePath;
+function withCpn(url, cpn) {
+  if (!url || !cpn || /[?&]cpn=/.test(url)) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}cpn=${cpn}`;
 }
 
-async function getInfoWithStreams(yt, videoId) {
+async function fetchChunk(url, start, end) {
+  const res = await fetch(`${url}&range=${start}-${end}`, {
+    headers: STREAM_HEADERS,
+    redirect: "follow",
+  });
+  if (!res.ok) {
+    throw new Error(`Stream fetch failed (${res.status}).`);
+  }
+  return Buffer.from(await res.arrayBuffer());
+}
+
+async function fetchUrlToFile(url, ext, cpn, contentLength) {
+  const filePath = createTempPath(ext);
+  const src = withCpn(url, cpn);
+  try {
+    let knownLen = Number(contentLength) || 0;
+    if (!knownLen) {
+      // Probe with a tiny range so googlevideo returns Content-Range.
+      const probe = await fetch(`${src}&range=0-1023`, {
+        headers: STREAM_HEADERS,
+        redirect: "follow",
+      });
+      if (probe.ok) {
+        const cr = probe.headers.get("content-range");
+        const total = cr && /\/(\d+)$/.exec(cr);
+        if (total) knownLen = Number(total[1]);
+        await probe.arrayBuffer();
+      }
+    }
+
+    if (knownLen > 0) {
+      const { createWriteStream } = await import("fs");
+      const out = createWriteStream(filePath);
+      let start = 0;
+      try {
+        while (start < knownLen) {
+          const end = Math.min(start + CHUNK_BYTES, knownLen) - 1;
+          const buf = await fetchChunk(src, start, end);
+          if (!buf.length) break;
+          await new Promise((resolve, reject) => {
+            out.write(buf, (err) => (err ? reject(err) : resolve()));
+          });
+          start = end + 1;
+        }
+      } finally {
+        await new Promise((resolve) => out.end(resolve));
+      }
+      return filePath;
+    }
+
+    const res = await fetch(src, { headers: STREAM_HEADERS, redirect: "follow" });
+    if (!res.ok) {
+      throw new Error(`Stream fetch failed (${res.status}).`);
+    }
+    if (!res.body) {
+      throw new Error("Empty stream body.");
+    }
+    await streamToFile(res.body, filePath);
+    return filePath;
+  } catch (err) {
+    await safeUnlink(filePath);
+    throw err;
+  }
+}
+
+async function downloadFormat(info, format, ext) {
+  try {
+    const stream = await info.download({
+      itag: format.itag,
+      type:
+        format.has_video && format.has_audio
+          ? "video+audio"
+          : format.has_video
+            ? "video"
+            : "audio",
+      format: "any",
+    });
+    const filePath = createTempPath(ext);
+    await streamToFile(stream, filePath);
+    return filePath;
+  } catch {
+    return fetchUrlToFile(format.url, ext, info.cpn, format.content_length);
+  }
+}
+
+async function eachStreamClient(yt, videoId, fn) {
   let lastErr;
   for (const client of STREAM_CLIENTS) {
     try {
       const info = await yt.getBasicInfo(videoId, { client });
       const formats = withDirectUrl(listFormats(info));
-      if (formats.length) return { info, formats, client };
-      lastErr = new Error(`No direct URLs from ${client}`);
+      if (!formats.length) {
+        lastErr = new Error(`No direct URLs from ${client}`);
+        continue;
+      }
+      const result = await fn(info, formats);
+      if (result) return result;
     } catch (err) {
       lastErr = err;
     }
@@ -228,15 +311,12 @@ async function fetchAudioMp3(yt, videoId, duration) {
     );
   }
 
-  const { formats } = await getInfoWithStreams(yt, videoId);
-  const audioFmt = pickAudioFormat(formats);
-  const muxedFmt = !audioFmt ? pickMuxedFormat(formats) : null;
-  const fmt = audioFmt || muxedFmt;
-  if (!fmt) {
-    throw new Error("No downloadable audio stream found.");
-  }
+  const rawPath = await eachStreamClient(yt, videoId, async (info, formats) => {
+    const fmt = pickAudioFormat(formats) || pickMuxedFormat(formats);
+    if (!fmt) return null;
+    return downloadFormat(info, fmt, ".audio");
+  });
 
-  const rawPath = await fetchUrlToFile(fmt.url, ".audio");
   const mp3Path = createTempPath(".mp3");
   try {
     await ffmpegConvert(rawPath, mp3Path, (cmd) =>
@@ -248,7 +328,7 @@ async function fetchAudioMp3(yt, videoId, duration) {
     await safeUnlink(rawPath);
     await safeUnlink(mp3Path);
     throw new Error(
-      err?.message?.includes("ffmpeg") || /ffmpeg/i.test(String(err))
+      /ffmpeg/i.test(String(err?.message || err))
         ? "FFmpeg failed converting audio. Is FFmpeg installed on PATH?"
         : friendlyYtError(err)
     );
@@ -262,34 +342,29 @@ async function fetchVideoMp4(yt, videoId, duration) {
     );
   }
 
-  const { formats } = await getInfoWithStreams(yt, videoId);
-
-  // Best path: separate video + audio (IOS), then mux.
-  const videoFmt = pickVideoFormat(formats, 720);
-  const audioFmt = pickAudioFormat(formats);
-  if (videoFmt && audioFmt) {
-    const videoPath = await fetchUrlToFile(videoFmt.url, ".v");
-    let audioPath;
-    const outPath = createTempPath(".mp4");
-    try {
-      audioPath = await fetchUrlToFile(audioFmt.url, ".a");
-      await mergeVideoAudio(videoPath, audioPath, outPath);
-      return outPath;
-    } catch (err) {
-      await safeUnlink(outPath);
-      // Fall through to muxed if merge fails
-      console.error("[ytdl] adaptive merge failed:", err?.message || err);
-    } finally {
-      await safeUnlink(videoPath);
-      await safeUnlink(audioPath);
+  return eachStreamClient(yt, videoId, async (info, formats) => {
+    const videoFmt = pickVideoFormat(formats, 720);
+    const audioFmt = pickAudioFormat(formats);
+    if (videoFmt && audioFmt) {
+      const videoPath = await downloadFormat(info, videoFmt, ".v");
+      let audioPath;
+      const outPath = createTempPath(".mp4");
+      try {
+        audioPath = await downloadFormat(info, audioFmt, ".a");
+        await mergeVideoAudio(videoPath, audioPath, outPath);
+        return outPath;
+      } catch {
+        await safeUnlink(outPath);
+      } finally {
+        await safeUnlink(videoPath);
+        await safeUnlink(audioPath);
+      }
     }
-  }
 
-  const muxed = pickMuxedFormat(formats, 720);
-  if (!muxed) {
-    throw new Error("No downloadable video stream found.");
-  }
-  return fetchUrlToFile(muxed.url, ".mp4");
+    const muxed = pickMuxedFormat(formats, 720);
+    if (!muxed) return null;
+    return downloadFormat(info, muxed, ".mp4");
+  });
 }
 
 command(
