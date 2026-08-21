@@ -26,10 +26,25 @@ import { enqueueJob } from "../enterprise/queue.js";
 
 let ytClient = null;
 
+/**
+ * Prefer clients that still return plain progressive/adaptive URLs.
+ * WEB is often SABR-only (no url / cipher → "No valid URL to decipher").
+ */
+const STREAM_CLIENTS = ["IOS", "ANDROID", "TV", "MWEB"];
+
+const STREAM_HEADERS = {
+  "User-Agent":
+    "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)",
+  Accept: "*/*",
+  Origin: "https://www.youtube.com",
+  Referer: "https://www.youtube.com",
+};
+
 async function getYt() {
   if (ytClient) return ytClient;
   const { Innertube } = await import("youtubei.js");
-  ytClient = await Innertube.create();
+  // No player retrieval — we only use clients that ship plaintext URLs.
+  ytClient = await Innertube.create({ retrieve_player: false });
   return ytClient;
 }
 
@@ -38,6 +53,14 @@ function pickQuery(message, pattern) {
   if (args) return args.trim();
   if (message.quoted?.text) return String(message.quoted.text).trim();
   return "";
+}
+
+function friendlyYtError(err) {
+  const msg = String(err?.message || err || "YouTube download failed.");
+  if (/no valid url to decipher|streaming.?data|decipher|sabr/i.test(msg)) {
+    return "YouTube blocked stream URLs for this IP/video. Try another video or again later.";
+  }
+  return msg;
 }
 
 async function resolveVideo(query) {
@@ -74,11 +97,96 @@ function videoMeta(info) {
   };
 }
 
-async function downloadToFile(yt, videoId, options, ext) {
-  const stream = await yt.download(videoId, options);
+function listFormats(info) {
+  const sd = info?.streaming_data;
+  if (!sd) return [];
+  return [...(sd.formats || []), ...(sd.adaptive_formats || [])];
+}
+
+/** Only formats with a ready-to-fetch URL (skip cipher/SABR). */
+function withDirectUrl(formats) {
+  return formats.filter((f) => typeof f.url === "string" && f.url.startsWith("http"));
+}
+
+function pickAudioFormat(formats) {
+  const audio = withDirectUrl(formats).filter((f) => f.has_audio && !f.has_video);
+  if (!audio.length) return null;
+  audio.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+  // Prefer mp4/m4a for easier ffmpeg → mp3
+  const m4a = audio.find((f) => /mp4|mp4a/i.test(f.mime_type || ""));
+  return m4a || audio[0];
+}
+
+function pickVideoFormat(formats, maxHeight = 720) {
+  const video = withDirectUrl(formats).filter((f) => f.has_video && !f.has_audio);
+  if (!video.length) return null;
+  const capped = video.filter((f) => (f.height || 0) <= maxHeight);
+  const pool = capped.length ? capped : video;
+  pool.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bitrate || 0) - (a.bitrate || 0));
+  const mp4 = pool.find((f) => /mp4|avc1/i.test(f.mime_type || ""));
+  return mp4 || pool[0];
+}
+
+function pickMuxedFormat(formats, maxHeight = 720) {
+  const muxed = withDirectUrl(formats).filter((f) => f.has_video && f.has_audio);
+  if (!muxed.length) return null;
+  const capped = muxed.filter((f) => (f.height || 0) <= maxHeight);
+  const pool = capped.length ? capped : muxed;
+  pool.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bitrate || 0) - (a.bitrate || 0));
+  return pool[0];
+}
+
+async function fetchUrlToFile(url, ext) {
   const filePath = createTempPath(ext);
-  await streamToFile(stream, filePath);
+  const res = await fetch(url, { headers: STREAM_HEADERS, redirect: "follow" });
+  if (!res.ok) {
+    await safeUnlink(filePath);
+    throw new Error(`Stream fetch failed (${res.status}).`);
+  }
+  if (!res.body) {
+    await safeUnlink(filePath);
+    throw new Error("Empty stream body.");
+  }
+  await streamToFile(res.body, filePath);
   return filePath;
+}
+
+async function getInfoWithStreams(yt, videoId) {
+  let lastErr;
+  for (const client of STREAM_CLIENTS) {
+    try {
+      const info = await yt.getBasicInfo(videoId, { client });
+      const formats = withDirectUrl(listFormats(info));
+      if (formats.length) return { info, formats, client };
+      lastErr = new Error(`No direct URLs from ${client}`);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error("No downloadable YouTube streams.");
+}
+
+async function mergeVideoAudio(videoPath, audioPath, outPath) {
+  const ffmpeg = (await import("fluent-ffmpeg")).default;
+  return new Promise((resolve, reject) => {
+    ffmpeg()
+      .input(videoPath)
+      .input(audioPath)
+      .outputOptions([
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+      ])
+      .on("end", () => resolve(outPath))
+      .on("error", (err) => reject(err))
+      .save(outPath);
+  });
 }
 
 async function sendAudioFile(conn, message, filePath, meta) {
@@ -120,33 +228,30 @@ async function fetchAudioMp3(yt, videoId, duration) {
     );
   }
 
-  // Prefer audio-only; remux to mp3 with ffmpeg for WA compatibility
-  const rawPath = await downloadToFile(
-    yt,
-    videoId,
-    { type: "audio", quality: "best", format: "any" },
-    ".audio"
-  );
+  const { formats } = await getInfoWithStreams(yt, videoId);
+  const audioFmt = pickAudioFormat(formats);
+  const muxedFmt = !audioFmt ? pickMuxedFormat(formats) : null;
+  const fmt = audioFmt || muxedFmt;
+  if (!fmt) {
+    throw new Error("No downloadable audio stream found.");
+  }
+
+  const rawPath = await fetchUrlToFile(fmt.url, ".audio");
   const mp3Path = createTempPath(".mp3");
   try {
-    try {
-      await ffmpegConvert(rawPath, mp3Path, (cmd) =>
-        cmd.noVideo().audioCodec("libmp3lame").audioBitrate("128k").format("mp3")
-      );
-      await safeUnlink(rawPath);
-      return mp3Path;
-    } catch {
-      // If already playable-ish, try sending raw as mp3 rename — still convert fail
-      await safeUnlink(mp3Path);
-      // Retry with video+audio then strip? fallback: return raw and hope
-      throw new Error(
-        "FFmpeg failed converting audio. Is FFmpeg installed on PATH?"
-      );
-    }
+    await ffmpegConvert(rawPath, mp3Path, (cmd) =>
+      cmd.noVideo().audioCodec("libmp3lame").audioBitrate("128k").format("mp3")
+    );
+    await safeUnlink(rawPath);
+    return mp3Path;
   } catch (err) {
     await safeUnlink(rawPath);
     await safeUnlink(mp3Path);
-    throw err;
+    throw new Error(
+      err?.message?.includes("ffmpeg") || /ffmpeg/i.test(String(err))
+        ? "FFmpeg failed converting audio. Is FFmpeg installed on PATH?"
+        : friendlyYtError(err)
+    );
   }
 }
 
@@ -157,16 +262,34 @@ async function fetchVideoMp4(yt, videoId, duration) {
     );
   }
 
-  return downloadToFile(
-    yt,
-    videoId,
-    {
-      type: "video+audio",
-      quality: "720p",
-      format: "mp4",
-    },
-    ".mp4"
-  );
+  const { formats } = await getInfoWithStreams(yt, videoId);
+
+  // Best path: separate video + audio (IOS), then mux.
+  const videoFmt = pickVideoFormat(formats, 720);
+  const audioFmt = pickAudioFormat(formats);
+  if (videoFmt && audioFmt) {
+    const videoPath = await fetchUrlToFile(videoFmt.url, ".v");
+    let audioPath;
+    const outPath = createTempPath(".mp4");
+    try {
+      audioPath = await fetchUrlToFile(audioFmt.url, ".a");
+      await mergeVideoAudio(videoPath, audioPath, outPath);
+      return outPath;
+    } catch (err) {
+      await safeUnlink(outPath);
+      // Fall through to muxed if merge fails
+      console.error("[ytdl] adaptive merge failed:", err?.message || err);
+    } finally {
+      await safeUnlink(videoPath);
+      await safeUnlink(audioPath);
+    }
+  }
+
+  const muxed = pickMuxedFormat(formats, 720);
+  if (!muxed) {
+    throw new Error("No downloadable video stream found.");
+  }
+  return fetchUrlToFile(muxed.url, ".mp4");
 }
 
 command(
@@ -264,7 +387,7 @@ command(
           filePath = await fetchAudioMp3(yt, id, meta.duration);
           await sendAudioFile(conn, message, filePath, meta);
         } catch (err) {
-          await replyFail(conn, message, err?.message || "ytmp3 failed.");
+          await replyFail(conn, message, friendlyYtError(err) || "ytmp3 failed.");
         } finally {
           await safeUnlink(filePath);
         }
@@ -295,7 +418,7 @@ command(
           filePath = await fetchVideoMp4(yt, id, meta.duration);
           await sendVideoFile(conn, message, filePath, meta);
         } catch (err) {
-          await replyFail(conn, message, err?.message || "ytmp4 failed.");
+          await replyFail(conn, message, friendlyYtError(err) || "ytmp4 failed.");
         } finally {
           await safeUnlink(filePath);
         }
@@ -327,7 +450,7 @@ command(
           filePath = await fetchAudioMp3(yt, id, meta.duration);
           await sendAudioFile(conn, message, filePath, meta);
         } catch (err) {
-          await replyFail(conn, message, err?.message || "play failed.");
+          await replyFail(conn, message, friendlyYtError(err) || "play failed.");
         } finally {
           await safeUnlink(filePath);
         }
